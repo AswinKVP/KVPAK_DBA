@@ -1,0 +1,89 @@
+-- Query to monitor I/O operations (IOPs) across database files
+-- Shows read/write stats by database file to identify high I/O activity
+
+-- For SQL Server 2008 and newer
+SELECT
+    DB_NAME(mf.database_id) AS DatabaseName,
+    mf.name AS LogicalFileName,
+    mf.physical_name AS PhysicalFileName,
+    mf.type_desc AS FileType,
+    fs.num_of_reads AS TotalReads,
+    fs.num_of_bytes_read AS TotalBytesRead,
+    CAST(fs.num_of_bytes_read / 1048576.0 AS DECIMAL(12, 2)) AS TotalMBRead,
+    fs.io_stall_read_ms AS ReadLatency_ms,
+    
+    fs.num_of_writes AS TotalWrites,
+    fs.num_of_bytes_written AS TotalBytesWritten,
+    CAST(fs.num_of_bytes_written / 1048576.0 AS DECIMAL(12, 2)) AS TotalMBWritten,
+    fs.io_stall_write_ms AS WriteLatency_ms,
+    
+    fs.io_stall AS TotalLatency_ms,
+    
+    -- Calculate IOPs metrics
+    fs.num_of_reads + fs.num_of_writes AS TotalIOs,
+    
+    -- Calculate average IOPs over time since last restart
+    CASE WHEN fs.sample_ms = 0 THEN 0 
+         ELSE (fs.num_of_reads + fs.num_of_writes) * 1000.0 / fs.sample_ms 
+    END AS IOPsRate,
+    
+    -- Calculate average bytes per I/O operation
+    CASE WHEN (fs.num_of_reads + fs.num_of_writes) = 0 THEN 0
+         ELSE (fs.num_of_bytes_read + fs.num_of_bytes_written) / (fs.num_of_reads + fs.num_of_writes * 1.0)
+    END AS AvgBytesPerIO,
+    
+    -- Average latency per I/O operation (milliseconds)
+    CASE WHEN (fs.num_of_reads + fs.num_of_writes) = 0 THEN 0
+         ELSE fs.io_stall / (fs.num_of_reads + fs.num_of_writes * 1.0)
+    END AS AvgIOLatency_ms,
+    
+    -- Calculate I/O activity time since SQL Server start
+    CAST(fs.sample_ms/1000.0/60.0/60.0 AS DECIMAL(12,2)) AS SampleHours,
+    
+    -- Size information
+    CAST(mf.size * 8 / 1024.0 AS DECIMAL(12, 2)) AS FileSizeMB
+FROM 
+    sys.dm_io_virtual_file_stats(NULL, NULL) AS fs
+INNER JOIN 
+    sys.master_files AS mf ON fs.database_id = mf.database_id AND fs.file_id = mf.file_id
+ORDER BY 
+    -- Order by highest total IOPs (reads + writes)
+    (fs.num_of_reads + fs.num_of_writes) DESC;
+
+-- Query to monitor current I/O activity by database
+-- Shows which databases are experiencing high I/O at this moment
+SELECT
+    DB_NAME(vfs.database_id) AS DatabaseName,
+    vfs.database_id,
+    vfs.file_id,
+    SUM(vfs.num_of_reads + vfs.num_of_writes) AS TotalIOs,
+    SUM(vfs.num_of_bytes_read + vfs.num_of_bytes_written) / 1048576.0 AS TotalMBTransferred,
+    SUM(vfs.io_stall) / 1000.0 AS TotalIOStall_sec
+FROM 
+    sys.dm_io_virtual_file_stats(NULL, NULL) AS vfs
+GROUP BY
+    vfs.database_id, vfs.file_id
+ORDER BY
+    TotalIOs DESC;
+
+-- To monitor I/O activity for specific operations (like during archiving)
+-- Run this before your operation, save results, then run again after operation and compare
+-- This will give you a view of the I/O impact of your specific operation
+
+-- Query to monitor server-wide I/O waits
+-- Shows what type of I/O waits are occurring
+SELECT
+    wait_type,
+    waiting_tasks_count,
+    wait_time_ms,
+    max_wait_time_ms,
+    signal_wait_time_ms
+FROM 
+    sys.dm_os_wait_stats
+WHERE
+    wait_type LIKE 'PAGEIOLATCH_%'
+    OR wait_type = 'IO_COMPLETION'
+    OR wait_type = 'WRITE_COMPLETION'
+    OR wait_type = 'ASYNC_IO_COMPLETION'
+ORDER BY
+    wait_time_ms DESC;
