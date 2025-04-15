@@ -1,0 +1,229 @@
+use dbadb
+
+-- Step 1: Create a table to store SQL Agent job history
+--USE [msdb]
+--GO
+
+-- Create table to store job history
+IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[JobHistoryArchive]') AND type in (N'U'))
+BEGIN
+    CREATE TABLE [dbo].[JobHistoryArchive](
+        [instance_id] [int] NOT NULL,
+        [job_id] [uniqueidentifier] NOT NULL,
+        [job_name] [nvarchar](128) NULL,
+        [step_id] [int] NOT NULL,
+        [step_name] [nvarchar](128) NULL,
+        [sql_message_id] [int] NOT NULL,
+        [sql_severity] [int] NOT NULL,
+        [message] [nvarchar](4000) NULL,
+        [run_status] [int] NOT NULL,
+        [run_date] [int] NOT NULL,
+        [run_time] [int] NOT NULL,
+        [run_duration] [int] NOT NULL,
+        [operator_id_emailed] [int] NOT NULL,
+        [operator_id_netsent] [int] NOT NULL,
+        [operator_id_paged] [int] NOT NULL,
+        [retries_attempted] [int] NOT NULL,
+        [server] [nvarchar](128) NOT NULL,
+        [archive_date] [datetime] NOT NULL DEFAULT GETDATE(),
+        CONSTRAINT [PK_JobHistoryArchive] PRIMARY KEY CLUSTERED 
+        (
+            [instance_id] ASC
+        )
+    )
+END
+GO
+
+-- Step 2: Create a stored procedure to archive job history
+IF EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[usp_ArchiveJobHistory]') AND type in (N'P'))
+    DROP PROCEDURE [dbo].[usp_ArchiveJobHistory]
+GO
+
+ALTER PROCEDURE [dbo].[usp_ArchiveJobHistory]
+AS
+BEGIN
+    SET NOCOUNT ON;
+    
+    -- Insert records from sysjobhistory into our archive table
+    INSERT INTO [dbo].[JobHistoryArchive]
+    (
+        [instance_id], [job_id], [job_name], [step_id], [step_name],
+        [sql_message_id], [sql_severity], [message], [run_status],
+        [run_date], [run_time], [run_duration], [operator_id_emailed],
+        [operator_id_netsent], [operator_id_paged], [retries_attempted],
+        [server], [archive_date]
+    )
+    SELECT 
+        h.[instance_id], h.[job_id], j.[name], h.[step_id], h.[step_name],
+        h.[sql_message_id], h.[sql_severity], h.[message], h.[run_status],
+        h.[run_date], h.[run_time], h.[run_duration], h.[operator_id_emailed],
+        h.[operator_id_netsent], h.[operator_id_paged], h.[retries_attempted],
+        CAST(SERVERPROPERTY('ServerName') AS nvarchar(128)), GETDATE()
+    FROM 
+        [msdb].[dbo].[sysjobhistory] h
+    INNER JOIN 
+        [msdb].[dbo].[sysjobs] j ON h.[job_id] = j.[job_id]
+    LEFT JOIN 
+        [DBADB].[dbo].[JobHistoryArchive] a ON h.[instance_id] = a.[instance_id]
+    WHERE 
+        a.[instance_id] IS NULL;
+    
+    -- Delete records older than 15 days from our archive table
+    DELETE FROM [dbo].[JobHistoryArchive]
+    WHERE [archive_date] < DATEADD(DAY, -15, GETDATE());
+    
+    -- Report how many records we're keeping
+    SELECT 'Job history records retained in archive: ' + CAST(COUNT(*) AS VARCHAR(20)) AS Status 
+    FROM [dbo].[JobHistoryArchive];
+END
+GO
+
+-- Step 3: Create SQL Agent Job to archive history regularly
+USE [msdb]
+GO
+
+-- First check if job already exists and delete if it does
+IF EXISTS (SELECT job_id FROM msdb.dbo.sysjobs WHERE name = N'Archive SQL Agent Job History')
+BEGIN
+    EXEC msdb.dbo.sp_delete_job @job_name = N'Archive SQL Agent Job History', @delete_unused_schedule = 1
+END
+GO
+
+-- Create the job
+BEGIN TRANSACTION
+    DECLARE @ReturnCode INT
+    SELECT @ReturnCode = 0
+    
+    -- Add the job
+    EXEC @ReturnCode = msdb.dbo.sp_add_job 
+        @job_name = N'Archive SQL Agent Job History',
+        @description = N'Archives SQL Agent job history to custom table for 15-day retention',
+        @category_name = N'Database Maintenance',
+        @owner_login_name = N'sa',
+        @enabled = 1,
+        @notify_level_eventlog = 0,
+        @notify_level_email = 0,
+        @delete_level = 0
+    
+    IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback
+    
+    -- Add the job step
+    EXEC @ReturnCode = msdb.dbo.sp_add_jobstep 
+        @job_name = N'Archive SQL Agent Job History',
+        @step_name = N'Archive Job History',
+        @step_id = 1,
+        @cmdexec_success_code = 0,
+        @on_success_action = 1,
+        @on_success_step_id = 0,
+        @on_fail_action = 2,
+        @on_fail_step_id = 0,
+        @retry_attempts = 0,
+        @retry_interval = 0,
+        @os_run_priority = 0,
+        @subsystem = N'TSQL',
+        @command = N'EXEC [msdb].[dbo].[usp_ArchiveJobHistory]',
+        @database_name = N'msdb',
+        @flags = 0
+    
+    IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback
+    
+    -- Add schedule to run every hour
+    EXEC @ReturnCode = msdb.dbo.sp_add_jobschedule 
+        @job_name = N'Archive SQL Agent Job History',
+        @name = N'Hourly',
+        @enabled = 1,
+        @freq_type = 4, -- Daily
+        @freq_interval = 1, -- Every day
+        @freq_subday_type = 8, -- Hour
+        @freq_subday_interval = 1, -- Every 1 hour
+        @freq_relative_interval = 0,
+        @freq_recurrence_factor = 0,
+        @active_start_date = 20250101,
+        @active_end_date = 99991231,
+        @active_start_time = 0,
+        @active_end_time = 235959
+    
+    IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback
+    
+    -- Add the job server
+    EXEC @ReturnCode = msdb.dbo.sp_add_jobserver 
+        @job_name = N'Archive SQL Agent Job History',
+        @server_name = N'(local)'
+    
+    IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback
+    
+    COMMIT TRANSACTION
+    GOTO EndSave
+    
+QuitWithRollback:
+    IF (@@TRANCOUNT > 0) ROLLBACK TRANSACTION
+    
+EndSave:
+GO
+
+-- Step 4: Run the job once to archive existing history
+EXEC msdb.dbo.sp_start_job N'Archive SQL Agent Job History'
+GO
+
+-- Create a view to easily query the archived history
+IF EXISTS (SELECT * FROM sys.views WHERE name = 'vw_JobHistory')
+    DROP VIEW dbo.vw_JobHistory
+GO
+
+CREATE VIEW dbo.vw_JobHistory
+AS
+SELECT 
+    job_name,
+    -- Convert run_date and run_time into a proper datetime
+    CONVERT(DATETIME, 
+        SUBSTRING(CONVERT(VARCHAR(8), run_date), 1, 4) + '-' +
+        SUBSTRING(CONVERT(VARCHAR(8), run_date), 5, 2) + '-' +
+        SUBSTRING(CONVERT(VARCHAR(8), run_date), 7, 2) + ' ' +
+        CASE WHEN LEN(CONVERT(VARCHAR(6), run_time)) = 6 
+            THEN SUBSTRING(CONVERT(VARCHAR(6), run_time), 1, 2) + ':' +
+                 SUBSTRING(CONVERT(VARCHAR(6), run_time), 3, 2) + ':' +
+                 SUBSTRING(CONVERT(VARCHAR(6), run_time), 5, 2)
+            WHEN LEN(CONVERT(VARCHAR(6), run_time)) = 5 
+            THEN '0' + SUBSTRING(CONVERT(VARCHAR(6), run_time), 1, 1) + ':' +
+                 SUBSTRING(CONVERT(VARCHAR(6), run_time), 2, 2) + ':' +
+                 SUBSTRING(CONVERT(VARCHAR(6), run_time), 4, 2)
+            WHEN LEN(CONVERT(VARCHAR(6), run_time)) = 4 
+            THEN '00:' + SUBSTRING(CONVERT(VARCHAR(6), run_time), 1, 2) + ':' +
+                 SUBSTRING(CONVERT(VARCHAR(6), run_time), 3, 2)
+            WHEN LEN(CONVERT(VARCHAR(6), run_time)) = 3 
+            THEN '00:0' + SUBSTRING(CONVERT(VARCHAR(6), run_time), 1, 1) + ':' +
+                 SUBSTRING(CONVERT(VARCHAR(6), run_time), 2, 2)
+            WHEN LEN(CONVERT(VARCHAR(6), run_time)) = 2 
+            THEN '00:00:' + SUBSTRING(CONVERT(VARCHAR(6), run_time), 1, 2)
+            WHEN LEN(CONVERT(VARCHAR(6), run_time)) = 1 
+            THEN '00:00:0' + CONVERT(VARCHAR(6), run_time)
+            ELSE '00:00:00'
+        END
+    ) AS run_datetime,
+    CASE run_status
+        WHEN 0 THEN 'Failed'
+        WHEN 1 THEN 'Succeeded'
+        WHEN 2 THEN 'Retry'
+        WHEN 3 THEN 'Canceled'
+        WHEN 4 THEN 'In Progress'
+    END AS status,
+    -- Format run_duration as HH:MM:SS
+    RIGHT('0' + CAST(run_duration/10000 AS VARCHAR), 2) + ':' +
+    RIGHT('0' + CAST((run_duration/100)%100 AS VARCHAR), 2) + ':' +
+    RIGHT('0' + CAST(run_duration%100 AS VARCHAR), 2) AS duration,
+    step_id,
+    step_name,
+    message,
+    archive_date
+FROM 
+    DBADB.dbo.JobHistoryArchive
+GO
+
+-- Sample query to check job history for the last 15 days
+SELECT * FROM dbo.vw_JobHistory
+WHERE run_datetime >= DATEADD(DAY, -15, GETDATE())
+and status <>'Succeeded'
+ORDER BY run_datetime DESC
+GO
+
+
